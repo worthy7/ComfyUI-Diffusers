@@ -5,4 +5,5 @@ safetensors
 omegaconf 
 pytorch_lightning
 xformers
+PIL
 git+https://github.com/cumulo-autumn/StreamDiffusion.git@main#egg=streamdiffusion[tensorrt]

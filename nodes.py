@@ -1,13 +1,21 @@
 import copy
 import os
+from typing import Union
+
 import torch
+from diffusers import (AutoencoderKL, AutoencoderTiny, LCMScheduler,
+                       StableDiffusionPipeline)
+from PIL import Image
 from safetensors.torch import load_file
-from .utils import SCHEDULERS, token_auto_concat_embeds, vae_pt_to_vae_diffuser, convert_images_to_tensors, convert_tensors_to_images, resize_images
-from comfy.model_management import get_torch_device
-import folder_paths
 from streamdiffusion import StreamDiffusion
 from streamdiffusion.image_utils import postprocess_image
-from diffusers import StableDiffusionPipeline, AutoencoderKL, AutoencoderTiny
+
+import folder_paths
+from comfy.model_management import get_torch_device
+
+from .utils import (SCHEDULERS, convert_images_to_tensors,
+                    convert_tensors_to_images, resize_images,
+                    token_auto_concat_embeds, vae_pt_to_vae_diffuser)
 
 
 class DiffusersPipelineLoader:
@@ -106,9 +114,10 @@ class DiffusersModelMakeup:
         return {
             "required": {
                 "pipeline": ("PIPELINE", ), 
+            }, "optional" : {
                 "scheduler": ("SCHEDULER", ),
-                "autoencoder": ("AUTOENCODER", ),
-            }, 
+                "autoencoder": ("AUTOENCODER", )
+            }
         }
 
     RETURN_TYPES = ("MAKED_PIPELINE",)
@@ -117,10 +126,10 @@ class DiffusersModelMakeup:
 
     CATEGORY = "Diffusers"
 
-    def makeup_pipeline(self, pipeline, scheduler, autoencoder):
+    def makeup_pipeline(self, pipeline, scheduler=None, autoencoder=None):
         pipeline = pipeline[0]
-        pipeline.vae = autoencoder
-        pipeline.scheduler = scheduler
+        pipeline.vae = pipeline.vae if autoencoder is None else autoencoder
+        pipeline.scheduler = LCMScheduler.from_config(pipeline.scheduler.config) if scheduler is None else scheduler
         pipeline.safety_checker = None if pipeline.safety_checker is None else lambda images, **kwargs: (images, [False])
         pipeline.enable_attention_slicing()
         pipeline = pipeline.to(self.torch_device)
@@ -237,9 +246,10 @@ class StreamDiffusionCreateStream:
                 "frame_buffer_size": ("INT", {"default": 1, "min": 1, "max": 10000}),
                 "cfg_type": (["none", "full", "self", "initialize"], {"default": "none"}),
                 "xformers_memory_efficient_attention": ("BOOLEAN", {"default": False}),
-                "lcm_lora" : ("LCM_LORA", ),
                 "tiny_vae" : ("STRING", {"default": "madebyollin/taesd"})
-            }, 
+            }, "optional" : {
+                "lcm_lora" : ("LCM_LORA", ),
+            }
         }
 
     RETURN_TYPES = ("STREAM",)
@@ -247,9 +257,9 @@ class StreamDiffusionCreateStream:
 
     CATEGORY = "Diffusers/StreamDiffusion"
 
-    def load_stream(self, maked_pipeline, t_index_list, width, height, do_add_noise, use_denoising_batch, frame_buffer_size, cfg_type, xformers_memory_efficient_attention, lcm_lora, tiny_vae):
-        maked_pipeline = copy.deepcopy(maked_pipeline)
-        lcm_lora = copy.deepcopy(lcm_lora)
+    def load_stream(self, maked_pipeline, t_index_list, width, height, do_add_noise, use_denoising_batch, frame_buffer_size, cfg_type, xformers_memory_efficient_attention, tiny_vae, lcm_lora=None,):
+        #maked_pipeline = copy.deepcopy(maked_pipeline)
+        #lcm_lora = copy.deepcopy(lcm_lora)
         stream = StreamDiffusion(
             pipe = maked_pipeline,
             t_index_list = t_index_list,
@@ -261,7 +271,10 @@ class StreamDiffusionCreateStream:
             frame_buffer_size = frame_buffer_size,
             cfg_type = cfg_type,
         )
-        stream.load_lcm_lora(lcm_lora)
+        if lcm_lora is not None:
+            stream.load_lcm_lora(lcm_lora)
+        else:
+            stream.load_lcm_lora()
         stream.fuse_lora()
         stream.vae = AutoencoderTiny.from_pretrained(
             pretrained_model_name_or_path=tiny_vae,
@@ -293,6 +306,7 @@ class StreamDiffusionSampler:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "num": ("INT", {"default": 1, "min": 1, "max": 10000}),
                 "warmup": ("INT", {"default": 1, "min": 0, "max": 10000}),
+                "denoise_lora": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step":0.01}),
             },
             "optional" : {
                 "image" : ("IMAGE", )
@@ -305,14 +319,15 @@ class StreamDiffusionSampler:
 
     CATEGORY = "Diffusers/StreamDiffusion"
 
-    def sample(self, stream: StreamDiffusion, positive, negative, steps, cfg, delta, seed, num, warmup, image = None):
+    def sample(self, stream: StreamDiffusion, positive, negative, steps, cfg, delta, seed, num, warmup, image = None, denoise_lora_strength = 1.0):
         stream.prepare(
             prompt = positive,
             negative_prompt = negative,
             num_inference_steps = steps,
             guidance_scale = cfg,
             delta = delta,
-            seed = seed
+            seed = seed,
+            denoise_lora_strength = denoise_lora_strength
         )
         
         if image != None:
@@ -348,6 +363,8 @@ class StreamDiffusionWarmup:
                 "delta": ("FLOAT", {"default": 1, "min": 0.0, "max": 1.0}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "warmup": ("INT", {"default": 1, "min": 0, "max": 10000}),
+                "denoise_lora": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step":0.01}),
+
             },
         }
 
@@ -357,14 +374,15 @@ class StreamDiffusionWarmup:
 
     CATEGORY = "Diffusers/StreamDiffusion"
 
-    def stream_warmup(self, stream: StreamDiffusion, negative, steps, cfg, delta, seed, warmup):
+    def stream_warmup(self, stream: StreamDiffusion, negative, steps, cfg, delta, seed, warmup, denoise_lora):
         stream.prepare(
             prompt="",
             negative_prompt=negative,
             num_inference_steps = steps,
             guidance_scale = cfg,
             delta = delta,
-            seed = seed
+            seed = seed,
+            denoise_lora_strength=denoise_lora
         )
         
         for _ in range(warmup):
@@ -381,7 +399,10 @@ class StreamDiffusionFastSampler:
                 "warmup_stream": ("WARMUP_STREAM", ),
                 "positive": ("STRING", {"multiline": True}),
                 "num": ("INT", {"default": 1, "min": 1, "max": 10000}),
-            },
+            }, "optional" : {
+                "latent_image": ("LATENT", {"tooltip": "The image without noise (may not work propery, original implementation)"}),
+                "image" : ("IMAGE", {"tooltip": "The latent image already with noise"} )
+            }
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -390,14 +411,45 @@ class StreamDiffusionFastSampler:
 
     CATEGORY = "Diffusers/StreamDiffusion"
 
-    def sample(self, warmup_stream, positive, num):
+    
+    def preprocess_image(self,stream: StreamDiffusion, image: Union[str, Image.Image]) -> torch.Tensor:
+        """
+        Preprocesses the image.
+
+        Parameters
+        ----------
+        image : Union[str, Image.Image, torch.Tensor]
+            The image to preprocess.
+
+        Returns
+        -------
+        torch.Tensor
+            The preprocessed image.
+        """
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB").resize((stream.width, stream.height))
+        if isinstance(image, Image.Image):
+            image = image.convert("RGB").resize((stream.width, stream.height))
+
+        return stream.image_processor.preprocess(
+            image, stream.height, stream.width
+        ).to(device=stream.device, dtype=stream.dtype)
+    
+    def sample(self, warmup_stream, positive, num, latent_image = None,image :torch.Tensor = None):
         stream: StreamDiffusion = warmup_stream
         
+        if image is not None:
+            image = image.movedim(-1,1)
+            
         stream.update_prompt(positive)
 
         result = []
         for _ in range(num):
-            x_output = stream.txt2img()
+            if (image is not None or latent_image is not None):
+                x_output = stream(self.preprocess_image(stream,image) if image is not None else None, 
+                                  latent_image)
+            else:
+                x_output = stream.txt2img()
             result.append(postprocess_image(x_output, output_type="pil")[0])
         return (convert_images_to_tensors(result),)
 
